@@ -70,12 +70,12 @@ Tavily 不讀圖，它只負責「拿 Gemini 想出來的那組關鍵字去查�
 
 ```mermaid
 flowchart LR
-    A["Ctrl+Alt+S<br/>框選截圖"] --> B["Gemini #1<br/>vision 讀圖"]
-    B -->|"最後一行<br/>QUERY: 關鍵字"| C["Tavily<br/>search_depth=basic"]
-    C -->|"5 筆 title/url/content"| D["Gemini #2<br/>整合回答"]
-    D --> E["主視窗"]
-    D --> F["shots/*.md"]
-    F --> G["127.0.0.1:8765<br/>marked.js"]
+    A[Ctrl+Alt+S 截圖] --> B[Gemini 讀圖]
+    B -->|QUERY| C[Tavily 搜尋]
+    C -->|5 筆結果| D[Gemini 整合]
+    D --> E[主視窗]
+    D --> F[shots md]
+    F --> G[127.0.0.1:8765 預覽]
 ```
 
 這樣切的理由：模型自己講的內容無法查證，搜尋結果又沒有看過圖。拆成兩段後，第一段只描述圖片看到什麼、哪裡需要查，第二段拿搜尋結果回來對照，衝突的地方要明講，來源網址也一併附上。
