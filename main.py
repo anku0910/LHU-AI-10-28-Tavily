@@ -55,7 +55,7 @@ PROMPT_RVS = """你是以圖搜圖結果的判讀員。使用者給你一張截�
 請用繁體中文（台灣用語）輸出：
 1. 結論：這是什麼作品、哪個角色、作者是誰，並說明把握程度。
 2. 證據：哪個引擎、相似度幾 %、站點標題與來源連結。
-3. 相似度低於 60% 的結果只能當線索，不能當結論；Google 圖片沒有相似度，只能當旁證；結果衝突時要指出來並說明哪個可信。
+3. 相似度低於 60% 的結果只能當線索，不能當結論；兩個引擎結論衝突時要指出來，並說明哪個可信。
 4. 完全查不到就寫「查無可靠來源」，不要硬猜。
 精簡，不要整段貼上原始比對結果。"""
 
@@ -369,14 +369,6 @@ def parse_iqdb(page: str):
     return out
 
 
-def google_lens(data: bytes) -> str:
-    r = requests.post("https://www.google.com/searchbyimage/upload",
-                      files={"encoded_image": ("shot.jpg", data, "image/jpeg")},
-                      data={"image_content": "", "filename": "shot.jpg"},
-                      headers=BROWSER_UA, allow_redirects=False, timeout=30)
-    return r.headers.get("Location", "")
-
-
 def parse_saucenao(page: str):
     out = []
     for block in re.findall(r'<div class="result(?: hidden)?">(.*?)(?=<div class="result(?: hidden)?">|'
@@ -408,26 +400,20 @@ def identify(img: Image.Image, question: str, step=lambda *a: None) -> str:
     ask = question or "這張圖是什麼作品、什麼角色？"
 
     errors = []
-    with ThreadPoolExecutor(3) as ex:
-        step(1, "Gemini 讀圖 + SauceNAO / Google 同時上傳")
+    with ThreadPoolExecutor(2) as ex:
+        step(1, "Gemini 讀圖 + SauceNAO 同時上傳")
         look_f = ex.submit(cached, key + ask, 1800, lambda: gemini([
             {"text": f"{PROMPT_LOOK}\n\n使用者問題：{ask}"},
             {"inline_data": {"mime_type": "image/png", "data": b64}},
         ]))
         sauce_f = ex.submit(cached, key + "sn", 1800,
                             lambda: parse_saucenao(post_saucenao(data)))
-        google_f = ex.submit(cached, key + "gl", 1800, lambda: google_lens(data))
         look = look_f.result()
         try:
             cands = sauce_f.result()
         except Exception as exc:
             cands = []
             errors.append(f"SauceNAO（{type(exc).__name__}）")
-        try:
-            google = google_f.result()
-        except Exception as exc:
-            google = ""
-            errors.append(f"Google（{type(exc).__name__}）")
 
     look_text, _, tail = look.rpartition("QUERY:")
     query = tail.strip().splitlines()[0].strip() if tail.strip() else ""
@@ -457,9 +443,9 @@ def identify(img: Image.Image, question: str, step=lambda *a: None) -> str:
         evidence = f"【引擎比對】\n{hits}"
         step(3, f"Gemini 整合（{len(cands)} 筆比對，{len(strong)} 筆高於 60%）")
     else:
-        step(3, f"三引擎無結果，改用 Tavily：{query or '（無關鍵字）'}")
+        step(3, f"SauceNAO／IQDB 無結果，改用 Tavily：{query or '（無關鍵字）'}")
         found = tavily(query) if query else []
-        evidence = ("【引擎比對】\n（SauceNAO、IQDB、Google 圖片都沒有命中）\n\n"
+        evidence = ("【引擎比對】\n（SauceNAO、IQDB 都沒有命中）\n\n"
                     f"【Tavily 搜尋：{query}】\n" +
                     ("\n".join(f"- {h.get('title')} | {(h.get('content') or '')[:200]} | {h.get('url')}"
                                for h in found[:5]) or "（無結果）"))
@@ -478,16 +464,12 @@ def identify(img: Image.Image, question: str, step=lambda *a: None) -> str:
           f"| 引擎 | 相似度 | 來源 |\n| --- | ---: | --- |\n"
           f"{rows or '| — | — | 沒有命中 |'}\n\n"
           f"## 看圖線索\n\n{look_text}\n")
-    if google:
-        md += f"\n## Google 圖片\n\n- [開啟 Google 圖片搜尋結果]({google})\n"
     if cands and len(cands) > len(shown):
         md += f"\n> 另有 {len(cands) - len(shown)} 筆比對低於 60%，未列入表格。\n"
     if best >= 80:
         md += f"\n> SauceNAO 最高 {best:.0f}%，未加查 IQDB。\n"
     if errors:
         md += f"\n> 未取得：{'、'.join(errors)}\n"
-    if google:
-        webbrowser.open(google)
     step(4, "輸出 Markdown 與本機預覽")
     return md + model_note()
 
