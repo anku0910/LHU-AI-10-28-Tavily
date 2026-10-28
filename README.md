@@ -13,8 +13,9 @@
 - 全域快捷鍵 `Ctrl+Alt+S`，或點系統匣圖示，兩種都能叫出截圖
 - 全螢幕遮罩自由框選，放開滑鼠立刻裁切
 - 彈窗輸入問題，右側 Debug 視窗同步顯示 API 走到第幾步與初步分析
-- 「以圖搜圖」按鈕：SauceNAO、IQDB、Google 圖片 三家並行比對，插畫／立繪也能找到原始出處
-- 結果輸出成 Markdown，本機網站每 2 秒自動更新
+- 「以圖搜圖」按鈕：SauceNAO、Google 圖片先跑，證據不足才補查 IQDB，插畫／立繪也能找到原始出處
+- 問答結果輸出成 Markdown，本機網站每 2 秒自動更新
+- 以圖搜圖結果在另一個頁面顯示，只留記憶體、不寫檔
 
 ## 套件與寫法
 
@@ -41,15 +42,17 @@ pystray         0.05 MB [▏                       ]   0.1%
 - **快捷鍵**：`RegisterHotKey(hWnd=None, ...)` 是綁「呼叫它的執行緒」的訊息佇列，所以註冊和 `GetMessageW` 必須在同一個執行緒；分開寫會收不到 `WM_HOTKEY`。
 - **pythonw 陷阱**：用 `pythonw.exe` 啟動時 `sys.stderr` 是 `None`，`SimpleHTTPRequestHandler.log_message` 會嘗試寫入而拋錯，連線在送標頭前就斷掉，瀏覽器只看到 `ERR_EMPTY_RESPONSE`。解法是把 `log_message` 覆寫成空方法。
 
-## 連接到 Gemini 與 Tavily
+## 連接到 Gemini、OpenRouter 與 Tavily
 
-兩組金鑰都放環境變數，不寫進程式碼，`GEMINI_MODEL` 可覆寫模型：
+金鑰全部放環境變數，不寫進程式碼。預設走 Gemini 官方端點；只要設了 `OPENROUTER_API_KEY`，程式啟動時就自動改走 OpenRouter，不用改任何一行。
 
 | 變數 | 用途 |
 | --- | --- |
-| `GEMINI_API_KEY` | 讀圖與整合，放在 `x-goog-api-key` header |
+| `GEMINI_API_KEY` | Gemini 官方端點，放在 `x-goog-api-key` header |
+| `OPENROUTER_API_KEY` | 有設就用 OpenRouter，放在 `Authorization: Bearer` |
 | `TAVILY_API_KEY` | 網路搜尋，放在 `Authorization: Bearer` |
 | `GEMINI_MODEL` | 選填，預設 `gemini-3-flash-preview` |
+| `OPENROUTER_MODEL` | 選填，預設 `google/gemini-3-flash-preview` |
 
 ```python
 r = requests.post(
@@ -58,10 +61,20 @@ r = requests.post(
     json={"contents": [{"parts": parts}]}, timeout=120)
 
 r = requests.post(
+    "https://openrouter.ai/api/v1/chat/completions",
+    headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+    json={"model": MODEL, "max_tokens": 3000,
+          "messages": [{"role": "user", "content": content}]}, timeout=120)
+
+r = requests.post(
     "https://api.tavily.com/search",
     headers={"Authorization": f"Bearer {os.environ['TAVILY_API_KEY']}"},
     json={"query": query, "search_depth": "basic", "max_results": 5}, timeout=60)
 ```
+
+兩家模型的輸入格式不同，內部統一用 Gemini 的 `parts`，呼叫前才轉成 OpenRouter 的 `content`：文字轉 `{"type": "text"}`，圖片轉 `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`。回覆則分別取 `candidates[0].content.parts` 與 `choices[0].message.content`。
+
+`max_tokens` 要設，不能留預設。OpenRouter 會用模型的預設上限（65536）去試算餘額，額度不夠就直接回 402，即使實際只會用掉幾百個 token。
 
 金鑰不走 URL 查詢參數，因為 `raise_for_status()` 會把整串網址印進錯誤訊息，等於把 key 印出來。
 
@@ -116,10 +129,12 @@ flowchart LR
 
 | 步驟 | 呼叫 | 輸入 | 產出 |
 | ---: | --- | --- | --- |
-| 1 | Gemini vision | 截圖 + `PROMPT_LOOK` | 內容、可辨識線索、候選作品／角色／繪師、`QUERY:` 一行 |
-| 2 | SauceNAO / IQDB / Google 圖片 | 同一張圖，三家並行上傳 | 相似度、來源連結、Google 結果頁網址 |
-| 3 | Gemini | 原圖 + 初步判讀 + 比對結果（三家都沒命中時改用 Tavily） | 判定與證據 |
+| 1 | Gemini vision ＋ SauceNAO / Google | 截圖 + `PROMPT_LOOK`，兩邊同時跑 | 內容與線索、`QUERY:`、SauceNAO 相似度、Google 結果頁 |
+| 2 | IQDB（必要時才查） | 同一張圖 | SauceNAO 最高相似度低於 80% 才補查 |
+| 3 | Gemini | 原圖 + 初步判讀 + 比對結果（都沒命中時改用 Tavily） | 判定與證據 |
 | 4 | 本機輸出 | 判定 + 比對表格 | `shots/*.md` 與瀏覽器預覽 |
+
+第 1 步的 Gemini 讀圖與兩家引擎上傳是並行的，誰先回來都不影響；第 2 步的 IQDB 只在 SauceNAO 信心不足時才查，因為它的佇列最慢卻最少用得上。
 
 三家分工：
 
@@ -129,7 +144,7 @@ flowchart LR
 | IQDB | booru 站（Danbooru / yande.re / Konachan…） | 佇列慢，忙的時候會回空頁 |
 | Google 圖片 | 涵蓋面最廣，照片、商品、截圖都吃 | 回傳的是結果頁網址，內容由 JS 產生，抓不到 |
 
-上傳前會先把裁切圖縮到 1500px、轉 JPEG 88%，避免大圖上傳被擋；三家同時跑，任一家失敗只記在「未取得」，不中斷流程。Google 的結果頁會自動在瀏覽器打開，連結也寫進 md。
+上傳前會先把裁切圖縮到 1500px、轉 JPEG 88%，避免大圖上傳被擋。SauceNAO 與 Google 一起跑，IQDB 視情況補上；任一家失敗只記在「未取得」，不中斷流程。Google 的結果頁會自動在瀏覽器打開，連結也寫進 md。
 
 `PROMPT_LOOK` 先產出「可辨識線索」（簽名、浮水印、帳號、遊戲 UI、畫風），這一步是關鍵：引擎回傳 40～50% 的雜訊時，靠這些線索才判斷得出哪一筆才是真的。
 
@@ -152,15 +167,28 @@ flowchart LR
 精簡，不要整段貼上原始比對結果。
 ```
 
+### 速度
+
+同一張裁切圖（用 md5 判斷）30 分鐘內重查會直接命中快取，連引擎都不用碰。實測：
+
+| 情境 | Gemini 官方 | OpenRouter |
+| --- | ---: | ---: |
+| 首次，SauceNAO 高分（略過 IQDB） | 18.5 秒 | 7.9 秒 |
+| 同一張圖重查（全快取） | 8.4 秒 | 4.0 秒 |
+| 首次且需要補查 IQDB | 多 10～40 秒 | 多 10～40 秒 |
+
+模型讀圖與引擎上傳並行，兩次模型呼叫（官方端點 5～10 秒、OpenRouter 2～4 秒）才是主要成本，搜尋本身不到 2 秒。
+
 ## 輸出形式
 
 | 位置 | 內容 |
 | --- | --- |
-| 主視窗 | 整合回答 + 來源清單（Markdown 原文） |
+| 主視窗 | 結果 Markdown 原文（問答與以圖搜圖共用同一個框） |
 | Debug 視窗 | `API 進度 n / 3`（問答）或 `n / 4`（以圖搜圖）、`QUERY`、初步分析全文 |
-| `shots/shot-YYYYmmdd-HHMMSS.md` | 每次結果留一份 |
-| `shots/latest.md` | 永遠是最新一份，網站讀這個 |
-| `http://127.0.0.1:8765/` | `marked.js` 渲染，每 2 秒重新抓 `latest.md` |
+| `shots/shot-YYYYmmdd-HHMMSS.md` | 問答結果留一份 |
+| `shots/latest.md` | 最新的問答結果，網站首頁讀這個 |
+| `http://127.0.0.1:8765/` | 問答頁，`marked.js` 渲染 `latest.md` |
+| `http://127.0.0.1:8765/rvs` | 以圖搜圖頁，渲染記憶體中的結果，**不寫檔** |
 
 Markdown 長這樣：
 
@@ -183,13 +211,15 @@ Markdown 長這樣：
 
 本機網站是 `http.server.ThreadingHTTPServer` 起在 `127.0.0.1`，只綁 loopback，不對外開放。前端只有一段 fetch + `setInterval`，所以分析完不用手動重整。網址固定 8765，被佔用會往後找 8766～8784。
 
+`/` 和 `/rvs` 兩頁只差在資料來源：問答讀磁碟上的 `latest.md`，以圖搜圖讀記憶體裡的 `LIVE["rvs"]`，由 handler 直接回傳，所以不會在 `shots/` 留下任何檔案。兩頁右上角互有連結，各自每 2 秒重新抓一次。想留下某次結果就自己從主視窗複製。
+
 ## 專案結構
 
 ```text
-main.py            全部程式（約 370 行）
+main.py            全部程式（約 700 行）
 app.ico            系統匣與捷徑圖示，程式產生
 requirements.txt   三個外部套件
-shots/             執行後產生：index.html、latest.md、歷史 md
+shots/             執行後產生：index.html、latest.md、問答歷史 md（以圖搜圖不寫檔）
 ```
 
 ## 執行
@@ -197,7 +227,12 @@ shots/             執行後產生：index.html、latest.md、歷史 md
 ```powershell
 pip install Pillow requests pystray
 
+# 走 Gemini 官方端點
 $env:GEMINI_API_KEY=[Environment]::GetEnvironmentVariable('GEMINI_API_KEY','User')
+
+# 或走 OpenRouter（有設這把就自動改用它，不必動程式）
+$env:OPENROUTER_API_KEY=[Environment]::GetEnvironmentVariable('OPENROUTER_API_KEY','User')
+
 $env:TAVILY_API_KEY=[Environment]::GetEnvironmentVariable('TAVILY_API_KEY','User')
 
 python main.py
@@ -209,8 +244,8 @@ python main.py
 
 ## 備註
 
-- 模型預設 `gemini-3-flash-preview`，可用 `GEMINI_MODEL` 覆寫；3.x 模型會在回覆中夾帶 `thought` 片段，取文字時會過濾掉。
+- 預設走 Gemini 官方端點（`GEMINI_MODEL`，預設 `gemini-3-flash-preview`）；設了 `OPENROUTER_API_KEY` 就改走 OpenRouter（`OPENROUTER_MODEL`，預設 `google/gemini-3-flash-preview`）。3.x 模型會在回覆中夾帶 `thought` 片段，取文字時會過濾掉。
 - 截圖只存在記憶體，不落地；寫到磁碟的只有 Markdown。
 - `marked.js` 走 jsDelivr CDN，第一次載入需要網路，之後瀏覽器會快取。要完全離線得把檔案放進 `shots/` 改相對路徑。
 - Debug 視窗是主視窗的子視窗，關掉主視窗會一起關；它仍會佔一個工作列按鈕。
-- IQDB 的佇列較慢（實測 10～40 秒），忙的時候會回空白頁，因此逾時設 40 秒並把失敗記在「未取得」，不影響另外兩家。
+- IQDB 佇列較慢（實測 10～40 秒，最久 129 秒）且忙的時候會回空白頁，所以只在 SauceNAO 低於 80% 時才補查，並用執行緒硬性上限 12 秒，失敗只記在「未取得」。

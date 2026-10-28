@@ -1,6 +1,7 @@
 import base64
 import ctypes
 import ctypes.wintypes
+import hashlib
 import html
 import http.server
 import io
@@ -19,7 +20,15 @@ import pystray
 import requests
 from PIL import Image, ImageDraw, ImageEnhance, ImageGrab, ImageTk
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+PROVIDER = "openrouter" if os.environ.get("OPENROUTER_API_KEY") else "gemini"
+if PROVIDER == "openrouter":
+    MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
+    MODELS = [MODEL, "google/gemini-2.5-flash"]
+else:
+    MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+    MODELS = [MODEL, "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"]
+USED = {"model": MODEL}
+RETRY = (429, 500, 502, 503, 504)
 DIM = 0.45
 HOTKEY_MODS = 0x0001 | 0x0002  # Ctrl + Alt
 HOTKEY_VK = 0x53               # S
@@ -57,9 +66,10 @@ PROMPT_LOOK = """你是看圖助手。先不要上網，只看這張圖，用繁
 4. 最後一行固定格式：QUERY: <最適合查證的關鍵字，專有名詞用原文>"""
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shots")
-PREVIEW = {"port": None, "opened": False}
+PREVIEW = {"port": None, "opened": False, "rvs": False}
+LIVE = {"rvs": "# 尚未有以圖搜圖結果\n\n按「以圖搜圖」，結果只留在記憶體，不寫檔。\n"}
 
-INDEX_HTML = """<!doctype html><meta charset="utf-8"><title>截圖分析</title>
+PAGE = """<!doctype html><meta charset="utf-8"><title>__TITLE__</title>
 <style>
  body{max-width:900px;margin:40px auto;padding:0 20px;color:#1f2328;background:#fff;
       font:16px/1.75 -apple-system,"Segoe UI","Noto Sans TC",sans-serif}
@@ -68,19 +78,27 @@ INDEX_HTML = """<!doctype html><meta charset="utf-8"><title>截圖分析</title>
  pre{background:#f6f8fa;padding:14px;border-radius:8px;overflow:auto}
  li{margin:.25em 0} #meta{color:#6b7280;font-size:13px}
 </style>
-<div id="meta">本機預覽 · 每 2 秒自動重新載入</div>
+<div id="meta">__META__ · 每 2 秒自動重新載入 · <a href="__HREF__">__ALT__</a></div>
 <div id="out">載入中…</div>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
+const FEED = '__FEED__';
 async function load(){
   try{
-    const r = await fetch('latest.md?t=' + Date.now());
+    const r = await fetch(FEED + '?t=' + Date.now());
     if(!r.ok) throw new Error(r.status);
     document.getElementById('out').innerHTML = marked.parse(await r.text());
   }catch(e){ document.getElementById('out').textContent = '尚未有結果'; }
 }
 load(); setInterval(load, 2000);
 </script>"""
+
+INDEX_HTML = (PAGE.replace("__TITLE__", "截圖分析").replace("__META__", "本機預覽")
+              .replace("__HREF__", "/rvs").replace("__ALT__", "以圖搜圖")
+              .replace("__FEED__", "latest.md"))
+RVS_HTML = (PAGE.replace("__TITLE__", "以圖搜圖").replace("__META__", "以圖搜圖 · 不存檔")
+            .replace("__HREF__", "/").replace("__ALT__", "截圖分析")
+            .replace("__FEED__", "/rvs.md"))
 
 
 def save_md(md: str) -> str:
@@ -93,11 +111,32 @@ def save_md(md: str) -> str:
 
 
 class PreviewHandler(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
+                      ".md": "text/markdown; charset=utf-8",
+                      ".html": "text/html; charset=utf-8"}
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=OUT_DIR, **kwargs)
 
     def log_message(self, *args):
         pass
+
+    def reply(self, body: bytes, ctype: str):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/rvs", "/rvs/"):
+            self.reply(RVS_HTML.encode(), "text/html; charset=utf-8")
+        elif path == "/rvs.md":
+            self.reply(LIVE["rvs"].encode(), "text/markdown; charset=utf-8")
+        else:
+            super().do_GET()
 
 
 def start_server() -> int:
@@ -129,18 +168,79 @@ def preview(md: str) -> str:
     return name
 
 
+def preview_live(md: str) -> str:
+    LIVE["rvs"] = md
+    if PREVIEW["port"] is None:
+        PREVIEW["port"] = start_server()
+    url = f"http://127.0.0.1:{PREVIEW['port']}/rvs"
+    if not PREVIEW["rvs"]:
+        PREVIEW["rvs"] = True
+        webbrowser.open(url)
+    return url
+
+
+class Retry(Exception):
+    pass
+
+
+def _google(parts, model):
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+        json={"contents": [{"parts": parts}]}, timeout=120)
+    if r.ok:
+        out = r.json()["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in out if not p.get("thought"))
+    if r.status_code in RETRY:
+        raise Retry(f"{model} {r.status_code}")
+    raise RuntimeError(f"Gemini {r.status_code}：{r.text[:200]}")
+
+
+def _openrouter(parts, model):
+    content = []
+    for p in parts:
+        if "text" in p:
+            content.append({"type": "text", "text": p["text"]})
+        else:
+            d = p["inline_data"]
+            content.append({"type": "image_url", "image_url": {
+                "url": f"data:{d['mime_type']};base64,{d['data']}"}})
+    r = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                 "X-Title": "Screenshot Q&A"},
+        json={"model": model, "max_tokens": 3000,
+              "messages": [{"role": "user", "content": content}]},
+        timeout=120)
+    if r.ok:
+        d = r.json()
+        msg = (d.get("choices") or [{}])[0].get("message") or {}
+        if msg.get("content"):
+            return msg["content"]
+        raise Retry(f"{model} 沒有回覆內容：{str(d)[:200]}")
+    if r.status_code in RETRY:
+        raise Retry(f"{model} {r.status_code} {r.text[:160]}")
+    raise RuntimeError(f"OpenRouter {r.status_code}：{r.text[:200]}")
+
+
 def gemini(parts):
-    for attempt in range(2):
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
-            headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
-            json={"contents": [{"parts": parts}]}, timeout=120)
-        if r.ok:
-            break
-        time.sleep(1.5)
-    r.raise_for_status()
-    out = r.json()["candidates"][0]["content"]["parts"]
-    return "".join(p.get("text", "") for p in out if not p.get("thought")).strip()
+    call = _openrouter if PROVIDER == "openrouter" else _google
+    err = ""
+    for model in MODELS:
+        try:
+            text = call(parts, model)
+        except (Retry, requests.RequestException) as exc:
+            err = str(exc)
+            continue
+        USED["model"] = model
+        return text.strip()
+    raise RuntimeError(err or "模型沒有回應")
+
+
+def model_note() -> str:
+    if USED["model"] == MODEL:
+        return ""
+    return f"\n> 主模型 `{MODEL}` 沒有回應，本次改用 `{USED['model']}`。\n"
 
 
 def ask_gemini(img: Image.Image, question: str):
@@ -173,7 +273,7 @@ def pipeline(img: Image.Image, question: str, step=lambda *a: None) -> str:
     final = synthesize(question, draft, query, hits)
     sources = "\n".join(f"- [{h.get('title')}]({h.get('url')})" for h in hits)
     return (f"# 截圖分析\n\n**問題**：{question}\n\n**搜尋關鍵字**：`{query}`\n\n"
-            f"## 整合回答\n\n{final}\n\n## 來源\n\n{sources}")
+            f"## 整合回答\n\n{final}\n\n## 來源\n\n{sources}" + model_note())
 
 
 def tavily(query: str):
@@ -187,6 +287,36 @@ def tavily(query: str):
 
 BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"}
+
+CACHE = {}
+
+
+def with_deadline(fn, seconds, label=""):
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(seconds)
+    if th.is_alive():
+        raise TimeoutError(f"{label or '呼叫'}超過 {seconds} 秒")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def cached(key: str, ttl: int, fn):
+    hit = CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    CACHE[key] = (time.time(), val)
+    return val
 
 
 def strip_tags(s: str) -> str:
@@ -273,39 +403,50 @@ def identify(img: Image.Image, question: str, step=lambda *a: None) -> str:
     buf = io.BytesIO()
     img.save(buf, "PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
-    step(1, "Gemini 讀圖（vision）")
-    look = gemini([
-        {"text": f"{PROMPT_LOOK}\n\n使用者問題：{question or '這張圖是什麼作品、什麼角色？'}"},
-        {"inline_data": {"mime_type": "image/png", "data": b64}},
-    ])
+    data = upload_bytes(img)
+    key = hashlib.md5(data).hexdigest()
+    ask = question or "這張圖是什麼作品、什麼角色？"
+
+    errors = []
+    with ThreadPoolExecutor(3) as ex:
+        step(1, "Gemini 讀圖 + SauceNAO / Google 同時上傳")
+        look_f = ex.submit(cached, key + ask, 1800, lambda: gemini([
+            {"text": f"{PROMPT_LOOK}\n\n使用者問題：{ask}"},
+            {"inline_data": {"mime_type": "image/png", "data": b64}},
+        ]))
+        sauce_f = ex.submit(cached, key + "sn", 1800,
+                            lambda: parse_saucenao(post_saucenao(data)))
+        google_f = ex.submit(cached, key + "gl", 1800, lambda: google_lens(data))
+        look = look_f.result()
+        try:
+            cands = sauce_f.result()
+        except Exception as exc:
+            cands = []
+            errors.append(f"SauceNAO（{type(exc).__name__}）")
+        try:
+            google = google_f.result()
+        except Exception as exc:
+            google = ""
+            errors.append(f"Google（{type(exc).__name__}）")
+
     look_text, _, tail = look.rpartition("QUERY:")
     query = tail.strip().splitlines()[0].strip() if tail.strip() else ""
     look_text = look_text.strip() or look
 
-    data = upload_bytes(img)
-    step(2, "上傳 SauceNAO / IQDB / Google 圖片")
-    cands, google, errors = [], "", []
-    counts = {}
-    with ThreadPoolExecutor(3) as ex:
-        jobs = {
-            "SauceNAO": ex.submit(lambda: parse_saucenao(post_saucenao(data))),
-            "IQDB": ex.submit(lambda: parse_iqdb(post_iqdb(data))),
-            "Google": ex.submit(lambda: google_lens(data)),
-        }
-        for name, fut in jobs.items():
-            try:
-                found = fut.result()
-            except Exception as exc:
-                errors.append(f"{name}（{type(exc).__name__}）")
-                counts[name] = "失敗"
-                continue
-            if name == "Google":
-                google = found
-                counts[name] = "有結果頁" if google else "沒有結果頁"
-            else:
-                cands += found
-                counts[name] = f"{len(found)} 筆"
-    step(2, "三引擎比對完成", "、".join(f"{k} {v}" for k, v in counts.items()))
+    best = max((c["sim"] for c in cands), default=0)
+    if best >= 80:
+        step(2, f"SauceNAO 最高 {best:.0f}%，略過 IQDB", "省下 10～40 秒的佇列等待")
+    else:
+        step(2, "SauceNAO 證據不足，加查 IQDB（最多等 12 秒）")
+        try:
+            cands += with_deadline(
+                lambda: cached(key + "iq", 1800, lambda: parse_iqdb(post_iqdb(data))),
+                12, "IQDB ")
+        except TimeoutError:
+            errors.append("IQDB（等超過 12 秒，背景仍會補進快取）")
+        except Exception as exc:
+            errors.append(f"IQDB（{type(exc).__name__}）")
+
     cands.sort(key=lambda c: -c["sim"])
     strong = [c for c in cands if c["sim"] >= 60]
     shown = strong or cands[:3]
@@ -341,12 +482,14 @@ def identify(img: Image.Image, question: str, step=lambda *a: None) -> str:
         md += f"\n## Google 圖片\n\n- [開啟 Google 圖片搜尋結果]({google})\n"
     if cands and len(cands) > len(shown):
         md += f"\n> 另有 {len(cands) - len(shown)} 筆比對低於 60%，未列入表格。\n"
+    if best >= 80:
+        md += f"\n> SauceNAO 最高 {best:.0f}%，未加查 IQDB。\n"
     if errors:
         md += f"\n> 未取得：{'、'.join(errors)}\n"
     if google:
         webbrowser.open(google)
     step(4, "輸出 Markdown 與本機預覽")
-    return md
+    return md + model_note()
 
 
 class Picker:
@@ -491,17 +634,21 @@ class Popup(tk.Toplevel):
         except Exception as exc:
             text = f"ERROR: {exc}"
             self.after(0, lambda: self.debug.fail(str(exc)))
-        self.after(0, lambda: self.show(text))
+        self.after(0, lambda: self.show(text, "rvs"))
 
-    def show(self, text):
+    def show(self, text, group="qa"):
         self.out.delete("1.0", "end")
         self.out.insert("end", text)
         self.out.see("1.0")
         self.btn.config(state="normal")
         self.btn2.config(state="normal")
         try:
-            name = preview(text)
-            self.debug.log(f"已輸出 shots/{name}（瀏覽器預覽每 2 秒更新）")
+            if group == "rvs":
+                url = preview_live(text)
+                self.debug.log(f"已在瀏覽器顯示 {url}（只留在記憶體，未寫檔）")
+            else:
+                name = preview(text)
+                self.debug.log(f"已輸出 shots/{name}（瀏覽器預覽每 2 秒更新）")
         except Exception as exc:
             self.debug.log(f"輸出 md 失敗: {exc}")
         if sys.stdout:
@@ -535,6 +682,7 @@ class App:
         self.icon = pystray.Icon("shot", tray_image(), "Screenshot Q&A  (Ctrl+Alt+S)", menu=pystray.Menu(
             pystray.MenuItem("Capture  Ctrl+Alt+S", self.capture, default=True),
             pystray.MenuItem("Open preview", self.open_preview),
+            pystray.MenuItem("Open reverse image search", self.open_rvs),
             pystray.MenuItem("Quit", self.quit)))
         threading.Thread(target=self.icon.run, daemon=True).start()
         threading.Thread(target=hotkey_listener, args=(self.events,), daemon=True).start()
@@ -562,6 +710,10 @@ class App:
     def open_preview(self, *_):
         if PREVIEW["port"]:
             webbrowser.open(f"http://127.0.0.1:{PREVIEW['port']}/")
+
+    def open_rvs(self, *_):
+        if PREVIEW["port"]:
+            webbrowser.open(f"http://127.0.0.1:{PREVIEW['port']}/rvs")
 
     def _capture(self):
         if self.picker is None or not self.picker.top.winfo_exists():
